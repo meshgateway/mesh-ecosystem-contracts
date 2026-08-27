@@ -4,79 +4,82 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {MeshSplitter} from "../src/MeshSplitter.sol";
 import {MeshSplitterFactory} from "../src/MeshSplitterFactory.sol";
-import {MockERC20, MockLocker} from "./mocks/Mocks.sol";
+import {MockERC20, MockFeeEscrow, MockLaunchFactory} from "./mocks/Mocks.sol";
 
 contract MeshSplitterTest is Test {
-    MockLocker locker;
-    MockERC20 token;
-    MockERC20 weth;
+    MockLaunchFactory ponsFactory;
+    MockFeeEscrow escrow;
+    MockERC20 usdg;
     MeshSplitterFactory factory;
     MeshSplitter splitter;
 
+    address token = makeAddr("launchedToken");
     address treasury = makeAddr("treasury");
     address payout = makeAddr("payout");
     address deployer = makeAddr("deployer");
     address stranger = makeAddr("stranger");
 
     function setUp() public {
-        locker = new MockLocker();
-        token = new MockERC20("Project Token", "PROJ");
-        weth = new MockERC20("Wrapped Ether", "WETH");
-        locker.register(address(token), deployer, address(weth));
+        ponsFactory = new MockLaunchFactory();
+        escrow = new MockFeeEscrow();
+        usdg = new MockERC20("USDG", "USDG");
+        ponsFactory.register(token, deployer);
 
-        factory = new MeshSplitterFactory(address(locker), treasury);
+        factory = new MeshSplitterFactory(address(ponsFactory), address(escrow), treasury);
         splitter = MeshSplitter(payable(factory.createSplitter(payout)));
 
         // The project links its creator fees to the splitter.
         vm.prank(deployer);
-        locker.setFeeRedirect(address(token), address(splitter));
+        ponsFactory.transferCreatorFeeRecipient(token, address(splitter));
     }
 
     function test_factoryWiring() public view {
-        assertEq(address(splitter.locker()), address(locker));
+        assertEq(address(splitter.ponsFactory()), address(ponsFactory));
+        assertEq(address(splitter.escrow()), address(escrow));
         assertEq(splitter.treasury(), treasury);
         assertEq(splitter.payout(), payout);
         assertEq(factory.splitterCount(), 1);
         assertEq(factory.splitters(0), address(splitter));
+        assertEq(ponsFactory.creatorFeeRecipient(token), address(splitter));
     }
 
-    function test_claimAndRelease_splitsBothAssets() public {
-        locker.setPending(address(token), 1_000e18, 5e18);
+    function test_claimAndRelease_splitsEscrowEth() public {
+        escrow.credit{value: 10 ether}(address(splitter));
 
         vm.prank(stranger); // permissionless
-        splitter.claimAndRelease(address(token));
+        splitter.claimAndRelease();
 
-        assertEq(token.balanceOf(treasury), 100e18);
-        assertEq(token.balanceOf(payout), 900e18);
-        assertEq(weth.balanceOf(treasury), 0.5e18);
-        assertEq(weth.balanceOf(payout), 4.5e18);
-        assertEq(token.balanceOf(address(splitter)), 0);
-        assertEq(weth.balanceOf(address(splitter)), 0);
+        assertEq(treasury.balance, 1 ether);
+        assertEq(payout.balance, 9 ether);
+        assertEq(address(splitter).balance, 0);
+        assertEq(escrow.balanceOf(address(splitter)), 0);
     }
 
-    function test_claimAndRelease_revertsWithoutRedirect() public {
-        // A second token that never linked its fees to the splitter: the
-        // locker must reject the splitter as caller.
-        MockERC20 other = new MockERC20("Other", "OTHR");
-        locker.register(address(other), deployer, address(weth));
-        locker.setPending(address(other), 1e18, 0);
-
-        vm.expectRevert(MockLocker.NotAuthorized.selector);
-        splitter.claimAndRelease(address(other));
+    function test_claimAndRelease_zeroBalanceIsNoop() public {
+        splitter.claimAndRelease();
+        assertEq(treasury.balance, 0);
+        assertEq(payout.balance, 0);
     }
 
-    function test_release_splitsDirectBalance() public {
-        // Fees collected by someone else (Pons automation, the deployer)
-        // still land on the splitter; release sweeps them.
-        vm.prank(deployer);
-        locker.setPending(address(token), 0, 10e18);
-        vm.prank(deployer);
-        locker.collectFees(address(token));
-        assertEq(weth.balanceOf(address(splitter)), 10e18);
+    function test_claimAndRelease_sweepsDirectBalanceToo() public {
+        // ETH that arrived outside the escrow path is split as well.
+        vm.deal(address(splitter), 2 ether);
+        escrow.credit{value: 8 ether}(address(splitter));
 
-        splitter.release(address(weth));
-        assertEq(weth.balanceOf(treasury), 1e18);
-        assertEq(weth.balanceOf(payout), 9e18);
+        splitter.claimAndRelease();
+        assertEq(treasury.balance, 1 ether);
+        assertEq(payout.balance, 9 ether);
+    }
+
+    function test_claimTokenAndRelease_splitsErc20PairingAsset() public {
+        escrow.creditToken(address(splitter), address(usdg), 1_000e18);
+
+        vm.prank(stranger);
+        splitter.claimTokenAndRelease(address(usdg));
+
+        assertEq(usdg.balanceOf(treasury), 100e18);
+        assertEq(usdg.balanceOf(payout), 900e18);
+        assertEq(usdg.balanceOf(address(splitter)), 0);
     }
 
     function test_release_native() public {
@@ -86,17 +89,41 @@ contract MeshSplitterTest is Test {
         assertEq(payout.balance, 9 ether);
     }
 
-    function test_release_zeroBalanceIsNoop() public {
-        splitter.release(address(token));
-        assertEq(token.balanceOf(treasury), 0);
+    function test_release_roundingFavorsPayout() public {
+        usdg.mint(address(splitter), 19);
+        splitter.release(address(usdg));
+        // 19 * 1000 / 10000 = 1 to treasury, remainder 18 to payout.
+        assertEq(usdg.balanceOf(treasury), 1);
+        assertEq(usdg.balanceOf(payout), 18);
     }
 
-    function test_release_roundingFavorsPayout() public {
-        token.mint(address(splitter), 19);
-        splitter.release(address(token));
-        // 19 * 1000 / 10000 = 1 to treasury, remainder 18 to payout.
-        assertEq(token.balanceOf(treasury), 1);
-        assertEq(token.balanceOf(payout), 18);
+    function test_transferFeeRecipient_exitHatch() public {
+        address newHome = makeAddr("newHome");
+
+        // Only the payout wallet can move the recipiency on.
+        vm.prank(stranger);
+        vm.expectRevert(MeshSplitter.NotPayout.selector);
+        splitter.transferFeeRecipient(token, newHome);
+
+        vm.prank(payout);
+        splitter.transferFeeRecipient(token, newHome);
+        assertEq(ponsFactory.creatorFeeRecipient(token), newHome);
+
+        // After leaving, the splitter can no longer take the role back.
+        vm.prank(payout);
+        vm.expectRevert(MockLaunchFactory.NotCreatorFeeRecipient.selector);
+        splitter.transferFeeRecipient(token, address(splitter));
+    }
+
+    function test_onlyRecipientCanLinkFees() public {
+        address other = makeAddr("otherToken");
+        ponsFactory.register(other, deployer);
+
+        // The splitter cannot seize recipiency of a token that never
+        // linked to it; only the current recipient hands it over.
+        vm.prank(payout);
+        vm.expectRevert(MockLaunchFactory.NotCreatorFeeRecipient.selector);
+        splitter.transferFeeRecipient(other, address(splitter));
     }
 
     function test_setPayout_onlyCurrentPayout() public {
@@ -121,22 +148,28 @@ contract MeshSplitterTest is Test {
     }
 
     function test_constructor_rejectsZeroAddresses() public {
+        address pf = address(ponsFactory);
+        address es = address(escrow);
         vm.expectRevert(MeshSplitter.ZeroAddress.selector);
-        new MeshSplitter(address(0), treasury, payout);
+        new MeshSplitter(address(0), es, treasury, payout);
         vm.expectRevert(MeshSplitter.ZeroAddress.selector);
-        new MeshSplitter(address(locker), address(0), payout);
+        new MeshSplitter(pf, address(0), treasury, payout);
         vm.expectRevert(MeshSplitter.ZeroAddress.selector);
-        new MeshSplitter(address(locker), treasury, address(0));
+        new MeshSplitter(pf, es, address(0), payout);
+        vm.expectRevert(MeshSplitter.ZeroAddress.selector);
+        new MeshSplitter(pf, es, treasury, address(0));
     }
 
-    function testFuzz_release_alwaysSplitsTenPercent(uint128 amount) public {
+    function testFuzz_claimAndRelease_alwaysSplitsTenPercent(uint96 amount) public {
         vm.assume(amount > 0);
-        token.mint(address(splitter), amount);
-        splitter.release(address(token));
+        vm.deal(address(this), amount);
+        escrow.credit{value: amount}(address(splitter));
+
+        splitter.claimAndRelease();
 
         uint256 expectedTreasury = (uint256(amount) * 1_000) / 10_000;
-        assertEq(token.balanceOf(treasury), expectedTreasury);
-        assertEq(token.balanceOf(payout), uint256(amount) - expectedTreasury);
-        assertEq(token.balanceOf(address(splitter)), 0);
+        assertEq(treasury.balance, expectedTreasury);
+        assertEq(payout.balance, uint256(amount) - expectedTreasury);
+        assertEq(address(splitter).balance, 0);
     }
 }

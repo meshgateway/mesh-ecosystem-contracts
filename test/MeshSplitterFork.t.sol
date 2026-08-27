@@ -2,99 +2,93 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
-import {MeshSplitter, IERC20} from "../src/MeshSplitter.sol";
+import {MeshSplitter} from "../src/MeshSplitter.sol";
 import {MeshSplitterFactory} from "../src/MeshSplitterFactory.sol";
-import {IPonsLaunchLocker} from "../src/interfaces/IPonsLaunchLocker.sol";
+import {IPonsV2FeeEscrow, IPonsV2LaunchFactory} from "../src/interfaces/IPonsV2.sol";
 
-/// @notice Fork tests against the live Pons v2 locker on Robinhood Chain.
-/// Run with: forge test --match-contract Fork --fork-url $ROBINHOOD_RPC_URL
+interface IEscrowCredit {
+    function credit(address recipient) external payable;
+}
+
+/// @notice Fork tests against the live Pons v2 contracts on Robinhood
+/// Chain, using a real launched token (MESH) and its real creator fee
+/// recipient. Run with:
+///   forge test --match-contract Fork --fork-url https://rpc.mainnet.chain.robinhood.com
 /// They are skipped when no fork is active so plain `forge test` stays green.
 contract MeshSplitterForkTest is Test {
-    // Pons v2 launch locker (verified on Blockscout).
-    address constant LOCKER = 0x736D76699C26D0d966744cAe304C000d471f7F35;
-    // WETH on Robinhood Chain, the paired side of every Pons pool.
-    address constant WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
-    // An actively traded Pons v2 token, used as the fork fixture. Override
-    // with PONS_TOKEN when it goes quiet.
-    address constant DEFAULT_TOKEN = 0x14623dD0784cb5C484F8935c7c218d110332b538;
+    // Pons v2 launch factory (verified as PonsV2LaunchFactory).
+    address constant PONS_FACTORY = 0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e;
+    // Pons v2 fee escrow (verified as V2FeeEscrow).
+    address constant ESCROW = 0xd3AFEB2a57f70eF218Aa82451c51B2fb0416Ac9e;
+    // MESH Gateway token, launched on Pons v2, and its creator wallet.
+    address constant MESH = 0x14641000A501bdc736116aBf84e6fCeA9B90A713;
+    address constant MESH_CREATOR = 0x8DF12b01c9a03C0A76Db42b040f54470Adead3b0;
 
     address treasury = makeAddr("treasury");
     address payout = makeAddr("payout");
 
     function _forked() internal view returns (bool) {
-        return LOCKER.code.length > 0;
+        return ESCROW.code.length > 0;
     }
 
-    function test_fork_claimAndReleaseFromLiveLocker() public {
+    function test_fork_linkClaimAndSplitAgainstLiveContracts() public {
         if (!_forked()) return;
-        address token = vm.envOr("PONS_TOKEN", DEFAULT_TOKEN);
 
-        IPonsLaunchLocker locker = IPonsLaunchLocker(LOCKER);
-        IPonsLaunchLocker.LaunchedToken memory launched = locker.getLaunchedToken(token);
-        assertTrue(launched.exists, "fixture token not launched on Pons");
-        assertEq(launched.pairedToken, WETH, "fixture token not paired with WETH");
-
-        MeshSplitterFactory factory = new MeshSplitterFactory(LOCKER, treasury);
+        MeshSplitterFactory factory = new MeshSplitterFactory(PONS_FACTORY, ESCROW, treasury);
         MeshSplitter splitter = MeshSplitter(payable(factory.createSplitter(payout)));
 
-        // The deployer links creator fees to the splitter, exactly as a
-        // project would from our dashboard instructions.
-        vm.prank(launched.deployer);
-        locker.setFeeRedirect(token, address(splitter));
-        assertEq(locker.feeRedirects(token), address(splitter));
+        // The creator links fees to the splitter, exactly as a project
+        // would from our dashboard instructions.
+        vm.prank(MESH_CREATOR);
+        IPonsV2LaunchFactory(PONS_FACTORY).transferCreatorFeeRecipient(MESH, address(splitter));
 
-        // The live position may have nothing pending at this block; probe
-        // first so the test only asserts the split when fees exist.
-        vm.prank(launched.deployer);
-        try locker.collectFees(token) returns (uint256, uint256) {
-            // Fees existed and just went to the splitter via the redirect.
-        } catch {
-            emit log("no pending fees at fork block, seeding splitter directly");
-            deal(WETH, address(splitter), 1 ether);
-        }
+        // New creator fees now credit to the splitter's escrow balance.
+        // The escrow's credit function is public and payable, so fund a
+        // deterministic amount instead of waiting for live trades.
+        vm.deal(address(this), 10 ether);
+        IEscrowCredit(ESCROW).credit{value: 10 ether}(address(splitter));
+        assertEq(IPonsV2FeeEscrow(ESCROW).balanceOf(address(splitter)), 10 ether);
 
-        uint256 tokenHeld = IERC20(token).balanceOf(address(splitter));
-        uint256 wethHeld = IERC20(WETH).balanceOf(address(splitter));
-        assertTrue(tokenHeld > 0 || wethHeld > 0, "splitter received nothing");
+        // Anyone can trigger the claim and split.
+        vm.prank(makeAddr("stranger"));
+        splitter.claimAndRelease();
 
-        splitter.release(token);
-        splitter.release(WETH);
-
-        assertEq(IERC20(token).balanceOf(treasury), tokenHeld / 10);
-        assertEq(IERC20(token).balanceOf(payout), tokenHeld - tokenHeld / 10);
-        assertEq(IERC20(WETH).balanceOf(treasury), wethHeld / 10);
-        assertEq(IERC20(WETH).balanceOf(payout), wethHeld - wethHeld / 10);
-        assertEq(IERC20(token).balanceOf(address(splitter)), 0);
-        assertEq(IERC20(WETH).balanceOf(address(splitter)), 0);
+        assertEq(treasury.balance, 1 ether);
+        assertEq(payout.balance, 9 ether);
+        assertEq(address(splitter).balance, 0);
+        assertEq(IPonsV2FeeEscrow(ESCROW).balanceOf(address(splitter)), 0);
     }
 
-    function test_fork_splitterIsAuthorizedCollector() public {
+    function test_fork_exitHatchReturnsRecipiency() public {
         if (!_forked()) return;
-        address token = vm.envOr("PONS_TOKEN", DEFAULT_TOKEN);
 
-        IPonsLaunchLocker locker = IPonsLaunchLocker(LOCKER);
-        IPonsLaunchLocker.LaunchedToken memory launched = locker.getLaunchedToken(token);
-        assertTrue(launched.exists);
-
-        MeshSplitterFactory factory = new MeshSplitterFactory(LOCKER, treasury);
+        MeshSplitterFactory factory = new MeshSplitterFactory(PONS_FACTORY, ESCROW, treasury);
         MeshSplitter splitter = MeshSplitter(payable(factory.createSplitter(payout)));
 
-        // Before the redirect the locker must reject the splitter as caller.
+        vm.prank(MESH_CREATOR);
+        IPonsV2LaunchFactory(PONS_FACTORY).transferCreatorFeeRecipient(MESH, address(splitter));
+
+        // The project leaves: the payout wallet hands recipiency back to
+        // the creator without MeshGateway's involvement.
+        vm.prank(payout);
+        splitter.transferFeeRecipient(MESH, MESH_CREATOR);
+
+        // The splitter no longer holds the role, so it cannot take it back.
+        vm.prank(payout);
         vm.expectRevert();
-        splitter.claimAndRelease(token);
+        splitter.transferFeeRecipient(MESH, address(splitter));
+    }
 
-        vm.prank(launched.deployer);
-        locker.setFeeRedirect(token, address(splitter));
+    function test_fork_strangerCannotSeizeRecipiency() public {
+        if (!_forked()) return;
 
-        // After the redirect the call is authorized. It either succeeds or
-        // reverts with NoFeesToCollect; either way it got past the
-        // authorization gate, which is what this test proves.
-        try splitter.claimAndRelease(token) {
-            assertTrue(
-                IERC20(token).balanceOf(payout) > 0 || IERC20(WETH).balanceOf(payout) > 0
-            );
-        } catch (bytes memory reason) {
-            assertEq(bytes4(reason), bytes4(keccak256("NoFeesToCollect()")));
-        }
+        MeshSplitterFactory factory = new MeshSplitterFactory(PONS_FACTORY, ESCROW, treasury);
+        MeshSplitter splitter = MeshSplitter(payable(factory.createSplitter(payout)));
+
+        // Without the creator's transfer, the splitter has no claim on the
+        // token's fees and the factory rejects the attempt.
+        vm.prank(payout);
+        vm.expectRevert();
+        splitter.transferFeeRecipient(MESH, address(splitter));
     }
 }

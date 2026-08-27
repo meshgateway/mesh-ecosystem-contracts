@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {IPonsLaunchLocker} from "./interfaces/IPonsLaunchLocker.sol";
+import {IPonsV2FeeEscrow, IPonsV2LaunchFactory} from "./interfaces/IPonsV2.sol";
 
 interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
@@ -9,24 +9,27 @@ interface IERC20 {
 }
 
 /// @title MeshSplitter
-/// @notice Receives the creator fee share of a Pons v2 token and splits it
-/// between the MeshGateway treasury and the project payout wallet at a
-/// fixed, immutable ratio. One splitter is deployed per ecosystem project.
+/// @notice Receives the Pons v2 creator fees of a MeshEcosystem project
+/// and splits them between the MeshGateway treasury and the project payout
+/// wallet at a fixed, immutable ratio. One splitter is deployed per project.
 ///
 /// How it is wired up:
 /// 1. MeshSplitterFactory deploys this contract with the project payout
 ///    wallet; the treasury address and share are fixed at deployment.
-/// 2. The token deployer calls setFeeRedirect(token, splitter) on the Pons
-///    locker, making this contract the creator fee recipient.
-/// 3. Anyone may call claimAndRelease(token). The splitter collects the
-///    accrued fees from the locker (it is authorized because it is the fee
-///    recipient) and pays out both assets in the same transaction.
+/// 2. The current creator fee recipient calls
+///    transferCreatorFeeRecipient(token, splitter) on the Pons v2 launch
+///    factory. From then on creator fees credit to this contract's balance
+///    in the Pons fee escrow, in the launch's pairing asset.
+/// 3. Anyone may call claimAndRelease. It pulls the escrow balance and
+///    pays out both parties in the same transaction.
 ///
 /// Trust properties:
 /// - The treasury address and its share are immutable. Nobody, including
 ///   the treasury, can raise the cut after deployment.
-/// - Releasing is permissionless. If MeshGateway disappears, the project
-///   can always trigger its own 90 percent payout.
+/// - Claiming and releasing are permissionless. If MeshGateway disappears,
+///   the project can always trigger its own 90 percent payout.
+/// - The project can leave at any time: the payout wallet can transfer the
+///   creator fee recipiency onward without MeshGateway's involvement.
 /// - The payout wallet can only be rotated by the current payout wallet.
 /// - There is no owner, no upgrade path, and no pause switch.
 contract MeshSplitter {
@@ -34,45 +37,58 @@ contract MeshSplitter {
     uint256 public constant TREASURY_SHARE_BPS = 1_000;
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
-    IPonsLaunchLocker public immutable locker;
+    IPonsV2LaunchFactory public immutable ponsFactory;
+    IPonsV2FeeEscrow public immutable escrow;
     address public immutable treasury;
 
     /// @notice Wallet receiving the project share of every release.
     address public payout;
 
-    event Claimed(address indexed token, uint256 amount0, uint256 amount1);
+    event Claimed(address indexed asset, uint256 amount);
     event Released(address indexed asset, uint256 treasuryAmount, uint256 payoutAmount);
     event PayoutUpdated(address indexed previousPayout, address indexed newPayout);
+    event FeeRecipientTransferred(address indexed token, address indexed newRecipient);
 
     error ZeroAddress();
     error NotPayout();
     error NativeTransferFailed();
     error TokenTransferFailed();
 
-    constructor(address locker_, address treasury_, address payout_) {
-        if (locker_ == address(0) || treasury_ == address(0) || payout_ == address(0)) {
+    constructor(address ponsFactory_, address escrow_, address treasury_, address payout_) {
+        if (
+            ponsFactory_ == address(0) || escrow_ == address(0) || treasury_ == address(0)
+                || payout_ == address(0)
+        ) {
             revert ZeroAddress();
         }
-        locker = IPonsLaunchLocker(locker_);
+        ponsFactory = IPonsV2LaunchFactory(ponsFactory_);
+        escrow = IPonsV2FeeEscrow(escrow_);
         treasury = treasury_;
         payout = payout_;
     }
 
-    /// @notice Accept native ETH in case fees ever arrive unwrapped.
+    /// @notice Receives the escrow's native ETH payout on claim.
     receive() external payable {}
 
-    /// @notice Collects accrued Pons creator fees for `token` and releases
-    /// both sides of the pair. Permissionless: the locker authorizes this
-    /// contract because it is the token's fee redirect target.
-    function claimAndRelease(address token) external {
-        (uint256 amount0, uint256 amount1) = locker.collectFees(token);
-        emit Claimed(token, amount0, amount1);
-
-        IPonsLaunchLocker.LaunchedToken memory launched = locker.getLaunchedToken(token);
-        release(token);
-        if (launched.pairedToken != token) {
-            release(launched.pairedToken);
+    /// @notice Claims this splitter's native ETH balance from the Pons fee
+    /// escrow and releases it. Permissionless and idempotent: a zero escrow
+    /// balance is a no-op, so keeper crons can call it blindly.
+    function claimAndRelease() external {
+        if (escrow.balanceOf(address(this)) > 0) {
+            uint256 amount = escrow.claim();
+            emit Claimed(address(0), amount);
         }
+        release(address(0));
+    }
+
+    /// @notice Same as claimAndRelease for launches paired against an ERC20
+    /// asset instead of ETH.
+    function claimTokenAndRelease(address asset) external {
+        if (escrow.balanceOfToken(address(this), asset) > 0) {
+            uint256 amount = escrow.claimToken(asset);
+            emit Claimed(asset, amount);
+        }
+        release(asset);
     }
 
     /// @notice Splits this contract's full balance of `asset` between the
@@ -91,6 +107,17 @@ contract MeshSplitter {
         emit Released(asset, treasuryAmount, payoutAmount);
     }
 
+    /// @notice The project's exit hatch. Once this splitter is the creator
+    /// fee recipient on Pons, only the splitter itself can pass that role
+    /// on; this lets the payout wallet do so at any time, moving future
+    /// fees (and the buyback vest beneficiary) wherever the project wants.
+    /// Fees already claimable by the splitter remain subject to the split.
+    function transferFeeRecipient(address token, address newRecipient) external {
+        if (msg.sender != payout) revert NotPayout();
+        ponsFactory.transferCreatorFeeRecipient(token, newRecipient);
+        emit FeeRecipientTransferred(token, newRecipient);
+    }
+
     /// @notice Rotates the payout wallet. Only the current payout wallet
     /// may call this; the treasury share is untouchable.
     function setPayout(address newPayout) external {
@@ -106,8 +133,7 @@ contract MeshSplitter {
             (bool ok,) = to.call{value: amount}("");
             if (!ok) revert NativeTransferFailed();
         } else {
-            (bool ok, bytes memory data) =
-                asset.call(abi.encodeCall(IERC20.transfer, (to, amount)));
+            (bool ok, bytes memory data) = asset.call(abi.encodeCall(IERC20.transfer, (to, amount)));
             if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) {
                 revert TokenTransferFailed();
             }
