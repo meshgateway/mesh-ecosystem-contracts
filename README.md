@@ -48,7 +48,14 @@ External addresses on Robinhood Chain (chain id 4663):
 | Pons v2 launch factory (`PonsV2LaunchFactory`) | `0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e` |
 | Pons v2 fee escrow (`V2FeeEscrow`) | `0xd3AFEB2a57f70eF218Aa82451c51B2fb0416Ac9e` |
 
-Deployed MeshEcosystem addresses will be listed here after mainnet deployment.
+Deployed MeshEcosystem addresses on Robinhood Chain:
+
+| Name | Address |
+| --- | --- |
+| MeshSplitterFactory | [`0x002565F730BEC9266Ae48D21E7eA0Efe8d597c09`](https://robinhoodchain.blockscout.com/address/0x002565f730bec9266ae48d21e7ea0efe8d597c09) |
+| MeshGateway treasury | `0x41790911f33ADabC8EfC3cA693410C5988F9237D` |
+
+The factory is verified on Blockscout, so the immutable wiring (Pons factory, fee escrow, treasury) can be read straight from the source tab. Treasury inflows fund the daily MeshGateway Earn distribution to $MESH holders.
 
 ## Development
 
